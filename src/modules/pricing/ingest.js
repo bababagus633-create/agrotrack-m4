@@ -1,4 +1,7 @@
 import cron from 'node-cron';
+import { EventEmitter } from 'node:events';
+
+export const priceEvents = new EventEmitter();
 
 const COMMODITIES = (process.env.COMMODITIES || 'padi').split(',');
 const REGIONS = (process.env.PRICE_REGIONS || 'kaarangrejo').split(',');
@@ -39,7 +42,7 @@ async function simulate(pricingRepo) {
         const last = await pricingRepo.latest({
           commodity, level, region_code: codeFor(level, region),
         });
-        if (last?.date === today()) { sudahAda = true; break; }
+        if (!process.env.DEMO_LIVE && last?.date === today()) { sudahAda = true; break; }
         prev[level] = last?.[PRICE_FIELD];
       }
       if (sudahAda) continue;
@@ -70,6 +73,7 @@ export async function runIngest(pricingRepo) {
   }
   const n = await pricingRepo.upsertMany(items);
   console.log(`[ingest] ${n} data harga diperbarui (${today()})`);
+  priceEvents.emit('prices:updated', { count: n, date: today(), at: new Date().toISOString() });
   return n;
 }
 

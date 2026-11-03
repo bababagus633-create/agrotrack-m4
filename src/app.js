@@ -9,6 +9,7 @@ import { createPricingRouter } from './modules/pricing/router.js';
 import { createHarvestRouter } from './modules/harvest/router.js';
 import { createWeatherRouter } from './modules/weather/router.js';
 import { createSupplyRouter } from './modules/supply/router.js';
+import pricingStream from './modules/pricing/stream.js';
 
 const publicDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -53,6 +54,7 @@ export function createApp({ repo, pricingRepo, harvestRepo, supplyRepo, jwtSecre
     res.json({ items: await svc.leadingCommodities(parse(plotsQuery, req.query)) });
   }));
 
+  app.use(pricingStream);
   if (pricingRepo) app.use('/api/v1/prices', createPricingRouter({ repo: pricingRepo, jwtSecret }));
   if (harvestRepo) app.use('/api/v1/harvest', createHarvestRouter({ repo: harvestRepo, jwtSecret, plots: svc }));
   app.use('/api/v1/weather', createWeatherRouter({ jwtSecret }));
