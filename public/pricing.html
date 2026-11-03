@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Harga Pasar Komoditas - AgroTrack</title>
+  <script src="/chart.umd.min.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; background: #f6f5f1; color: #1f2a24; }
+    header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 16px 20px; background: #fff; border-bottom: 1px solid #ddd; }
+    h1 { font-size: 20px; margin: 0 auto 0 0; }
+    input, select, button { padding: 8px 10px; border: 1px solid #bbb; border-radius: 6px; font: inherit; }
+    button { background: #1e5a3c; color: #fff; border-color: #1e5a3c; cursor: pointer; }
+    main { padding: 20px; max-width: 1000px; margin: auto; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }
+    .card { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px 14px; }
+    .card small { color: #666; display: block; }
+    .card b { font-size: 20px; }
+    #msg { color: #b00020; min-height: 1.2em; }
+  </style>
+  <script src="/nav.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Harga pasar komoditas</h1>
+    <select id="commodity">
+      <option>padi</option><option>jagung</option><option>kedelai</option><option>cabai</option>
+    </select>
+    <input id="region" value="kaarangrejo" aria-label="Kode wilayah">
+    <select id="bucket">
+      <option value="month">Per bulan</option><option value="day">Per hari</option>
+    </select>
+    <button id="load">Muat grafik</button>
+  </header>
+  <main>
+    <p id="msg"></p>
+    <small id="updated" style="color:#666"></small>
+    <div class="cards" id="cards"></div>
+    <canvas id="chart" height="110"></canvas>
+  </main>
+  <script>
+    const m = location.hash.match(/token=([^&]+)/);
+    if (m) sessionStorage.setItem('token', m[1]);
+    const token = sessionStorage.getItem('token');
+    const $ = (id) => document.getElementById(id);
+    const rp = (n) => 'Rp ' + n.toLocaleString('id-ID');
+    const COLORS = { petani: '#1e5a3c', lokal: '#d98a1a', nasional: '#3a6ea5' };
+    const REFRESH_MS = 30000; // 30 detik
+    let chart;
+
+    async function api(path) {
+      const res = await fetch('/api/v1/prices' + path, { headers: { Authorization: 'Bearer ' + token } });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error?.message ?? 'Gagal memuat data.');
+      return body;
+    }
+
+    function drawChart(t) {
+      const datasets = t.series.map((s) => ({
+        label: s.level, data: s.values, borderColor: COLORS[s.level],
+        backgroundColor: COLORS[s.level], pointRadius: 0, borderWidth: 2, spanGaps: true,
+      }));
+      if (chart) {
+        chart.data.labels = t.labels;
+        chart.data.datasets = datasets;
+        chart.update('none');
+        return;
+      }
+      chart = new Chart($('chart'), {
+        type: 'line',
+        data: { labels: t.labels, datasets },
+        options: {
+          scales: { y: { ticks: { callback: (v) => rp(v) } } },
+          interaction: { mode: 'index', intersect: false },
+        },
+      });
+    }
+
+    function drawCards(g) {
+      $('cards').innerHTML = [
+        ['Harga petani', rp(g.farmer.price_idr), g.farmer.date],
+        ['Harga pasar lokal', rp(g.market.price_idr), g.market.date],
+        ['Selisih tata niaga', rp(g.margin_idr), 'per kg'],
+        ['Bagian diterima petani', g.farmer_share_pct + '%', 'dari harga pasar'],
+      ].map(([a, b, c]) => `<div class="card"><small>${a}</small><b>${b}</b><small>${c}</small></div>`).join('');
+    }
+
+    async function load(silent = false) {
+      if (!silent) $('msg').textContent = '';
+      if (!token) { $('msg').textContent = 'Token tidak ada. Buka halaman lewat URL dari npm run token.'; return; }
+      const qs = '?commodity=' + encodeURIComponent($('commodity').value)
+        + '&region_code=' + encodeURIComponent($('region').value);
+      try {
+        const [trend, margin] = await Promise.all([
+          api('/trend' + qs + '&bucket=' + $('bucket').value),
+          api('/margin' + qs),
+        ]);
+        drawChart(trend);
+        drawCards(margin);
+        $('msg').textContent = '';
+        $('updated').textContent = 'Diperbarui ' + new Date().toLocaleTimeString('id-ID');
+      } catch (e) {
+        if (!silent) $('msg').textContent = e.message;
+      }
+    }
+
+    $('load').onclick = () => load();
+    load();
+    setInterval(() => { if (!document.hidden) load(true); }, REFRESH_MS);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) load(true); });
+  </script>
+</body>
+</html>

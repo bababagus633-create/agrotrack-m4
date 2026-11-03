@@ -1,0 +1,24 @@
+{
+  "name": "agrotrack-geo-mapping",
+  "version": "0.1.0",
+  "description": "AgroTrack M4 - Geo-Spatial Farmland Mapping (MVP)",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node --env-file=.env src/server.js",
+    "dev": "node --env-file=.env --watch src/server.js",
+    "test": "node --test",
+    "token": "node --env-file=.env scripts/dev-token.js",
+    "seed": "node --env-file=.env scripts/seed-prices.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongodb": "^6.9.0",
+    "node-cron": "^4.6.0",
+    "qrcode": "^1.5.4",
+    "zod": "^3.23.8"
+  }
+}

@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Peta Lahan Kelompok Tani - AgroTrack M4</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css">
+<style>
+:root{--paper:#f6f8f4;--ink:#1c2b23;--muted:#5d6e64;--line:#d3dad0;--field:#245c45;--field-d:#1a4634;--warn:#9a3412}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{display:grid;grid-template-rows:auto 1fr;font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--ink);background:var(--paper)}
+header{display:flex;flex-wrap:wrap;gap:.75rem 1.25rem;align-items:center;padding:.7rem 1rem;border-bottom:1px solid var(--line)}
+h1{margin:0;font:600 1.25rem Georgia,"Times New Roman",serif;letter-spacing:.01em}
+.bar{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin-left:auto}
+input,button{font:inherit}
+input{padding:.4rem .6rem;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);min-width:0}
+button,.btn{padding:.4rem .8rem;border:1px solid var(--field);border-radius:6px;background:var(--field);color:#fff;cursor:pointer}
+button.ghost,.btn.ghost{background:transparent;color:var(--field)}
+button:hover,.btn:hover{background:var(--field-d);color:#fff}
+:focus-visible{outline:3px solid #f0b429;outline-offset:2px}
+main{display:grid;grid-template-columns:300px 1fr;min-height:0}
+aside{overflow:auto;padding:1rem;border-right:1px solid var(--line)}
+aside h2{margin:0 0 .5rem;font:600 1rem Georgia,serif}
+aside ul{list-style:none;margin:0 0 1.25rem;padding:0}
+aside li{padding:.5rem 0;border-bottom:1px solid var(--line)}
+.dot{display:inline-block;width:.8rem;height:.8rem;border-radius:50%;margin-right:.4rem;vertical-align:-1px}
+.sub{color:var(--muted);font-size:.85rem}
+#status{min-height:1.4rem;color:var(--warn);font-size:.9rem}
+#map{min-height:320px}
+dialog{border:1px solid var(--line);border-radius:10px;padding:1.2rem;max-width:22rem;width:92vw}
+dialog::backdrop{background:rgba(20,30,25,.45)}
+dialog label{display:block;margin:.6rem 0 .15rem;font-size:.9rem}
+dialog input{width:100%}
+.row{display:flex;gap:.5rem;justify-content:flex-end;margin-top:1rem}
+@media(max-width:760px){main{grid-template-columns:1fr;grid-template-rows:auto 1fr}aside{max-height:34vh;border-right:0;border-bottom:1px solid var(--line)}.bar{margin-left:0}}
+</style>
+  <script src="/nav.js"></script>
+</head>
+<body>
+<header>
+  <h1>Peta lahan kelompok tani</h1>
+  <div class="bar">
+    <input id="token" type="password" placeholder="Token JWT" aria-label="Token JWT" size="14">
+    <input id="fRegion" placeholder="Wilayah" aria-label="Filter wilayah" size="10">
+    <input id="fCom" placeholder="Komoditas" aria-label="Filter komoditas" size="10">
+    <button id="reload">Muat peta</button>
+    <label class="btn ghost" for="imp">Impor GeoJSON</label>
+    <input id="imp" type="file" accept=".geojson,.json,application/geo+json,application/json" hidden>
+  </div>
+</header>
+<main>
+  <aside>
+    <p id="status" role="status"></p>
+    <h2>Komoditas unggulan per wilayah</h2>
+    <ul id="leading"><li class="sub">Muat peta untuk melihat ringkasan.</li></ul>
+    <h2>Cara menambah lahan</h2>
+    <p class="sub">Pilih ikon poligon di kiri atas peta, klik titik-titik batas lahan, lalu klik titik pertama untuk menutup. Luas dihitung otomatis.</p>
+  </aside>
+  <div id="map" aria-label="Peta poligon lahan"></div>
+</main>
+
+<dialog id="dlg">
+  <form method="dialog" id="form">
+    <strong>Simpan lahan</strong>
+    <label for="fName">Nama lahan</label><input id="fName" required maxlength="120">
+    <label for="fReg">Kode wilayah</label><input id="fReg" required maxlength="60" placeholder="grobogan">
+    <label for="fCrop">Komoditas</label><input id="fCrop" maxlength="40" placeholder="padi">
+    <label for="fGrp">Kelompok tani</label><input id="fGrp" maxlength="120">
+    <label for="fFarm">ID lahan di M3 (opsional)</label><input id="fFarm" maxlength="64">
+    <div class="row"><button type="button" class="ghost" id="cancel">Batal</button><button type="submit">Simpan lahan</button></div>
+  </form>
+</dialog>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const say = (m) => { $('#status').textContent = m || ''; };
+
+let token = '';
+const m = location.hash.match(/token=([^&]+)/);
+if (m) { token = m[1]; try { sessionStorage.setItem('token', m[1]); } catch {} $('#token').value = token; history.replaceState(null, '', location.pathname); }
+$('#token').addEventListener('input', (e) => { token = e.target.value.trim(); });
+
+async function api(path, opt = {}) {
+  const r = await fetch('/api/v1' + path, { ...opt, headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' } });
+  if (r.status === 204) return null;
+  const b = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const d = b.error?.details?.[0];
+    const extra = d ? ' (' + (d.path || d.feature) + ': ' + (d.message || JSON.stringify(d.details)) + ')' : '';
+    throw new Error((b.error?.message || 'Permintaan gagal (HTTP ' + r.status + ').') + extra);
+  }
+  return b;
+}
+
+const pal = ['#2f7d4f', '#d98e04', '#c2410c', '#6d28d9', '#0e7490', '#be185d', '#4d7c0f', '#475569'];
+const colors = {};
+const colorOf = (c) => (colors[c || '-'] ??= pal[Object.keys(colors).length % pal.length]);
+
+const map = L.map('map').setView([-2.5, 118], 5);
+const osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19,
+  attribution: '&copy; OpenStreetMap',
+});
+const satelit = L.tileLayer(
+  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+  { maxZoom: 19, maxNativeZoom: 18, attribution: 'Tiles &copy; Esri, Maxar, Earthstar Geographics' }
+);
+const label = L.tileLayer(
+  'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+  { maxZoom: 19, maxNativeZoom: 18 }
+);
+osm.addTo(map);
+L.control.layers({
+  'Peta': osm,
+  'Satelit': satelit,
+  'Satelit + nama tempat': L.layerGroup([satelit, label]),
+}, null, { position: 'topright' }).addTo(map);
+const layer = L.featureGroup().addTo(map);
+map.addControl(new L.Control.Draw({
+  edit: false,
+  draw: { polygon: { allowIntersection: false, showArea: false }, polyline: false, rectangle: false, circle: false, marker: false, circlemarker: false },
+}));
+
+function popup(f) {
+  const p = f.properties;
+  return `<strong>${esc(p.name)}</strong><br>Wilayah: ${esc(p.region_code)}<br>Komoditas: ${esc(p.commodity || 'belum diisi')}`
+    + `<br>Kelompok tani: ${esc(p.group_name || '-')}<br>Luas: ${esc(p.area_ha)} ha`
+    + `<br><button type="button" data-del="${esc(p.id)}" style="margin-top:.5rem">Hapus lahan</button>`;
+}
+
+async function load(fit = true) {
+  if (!token) return say('Isi token JWT di kolom atas dulu.');
+  const q = new URLSearchParams();
+  if ($('#fRegion').value.trim()) q.set('region_code', $('#fRegion').value.trim());
+  if ($('#fCom').value.trim()) q.set('commodity', $('#fCom').value.trim());
+  try {
+    const [fc, lead] = await Promise.all([api('/plots?' + q), api('/regions/leading-commodities?' + q)]);
+    layer.clearLayers();
+    layer.addLayer(L.geoJSON(fc, {
+      style: (f) => ({ color: colorOf(f.properties.commodity), weight: 2, fillOpacity: 0.35 }),
+      onEachFeature: (f, l) => l.bindPopup(popup(f)),
+    }));
+    if (fit && fc.features.length) map.fitBounds(layer.getBounds().pad(0.15));
+    renderLeading(lead.items);
+    say(fc.features.length ? '' : 'Belum ada lahan. Gambar poligon atau impor GeoJSON.');
+  } catch (e) { say(e.message); }
+}
+
+function renderLeading(items) {
+  $('#leading').innerHTML = items.length ? items.map((r) => {
+    const l = r.leading;
+    const head = l ? `<span class="dot" style="background:${colorOf(l.commodity)}"></span>${esc(l.commodity)} unggulan (${Math.round(l.share * 100)}%)` : 'Komoditas belum diisi';
+    return `<li><strong>${esc(r.region_code)}</strong><br>${head}<br><span class="sub">${esc(r.plot_count)} lahan, ${esc(r.total_ha)} ha</span></li>`;
+  }).join('') : '<li class="sub">Belum ada data.</li>';
+}
+
+map.on('popupopen', (e) => {
+  const b = e.popup.getElement().querySelector('[data-del]');
+  if (b) b.onclick = async () => {
+    if (!confirm('Hapus lahan ini?')) return;
+    try { await api('/plots/' + b.dataset.del, { method: 'DELETE' }); map.closePopup(); await load(false); say('Lahan dihapus.'); }
+    catch (err) { say(err.message); }
+  };
+});
+
+let pending = null;
+map.on(L.Draw.Event.CREATED, (e) => {
+  if (!token) return say('Isi token JWT di kolom atas dulu.');
+  pending = e.layer.toGeoJSON().geometry;
+  $('#fReg').value = $('#fRegion').value.trim();
+  $('#dlg').showModal();
+});
+$('#cancel').onclick = () => { pending = null; $('#dlg').close(); };
+$('#form').addEventListener('submit', async () => {
+  const opt = (id) => $(id).value.trim() || undefined;
+  const body = { client_id: crypto.randomUUID(), name: $('#fName').value.trim(), region_code: $('#fReg').value.trim(),
+    commodity: opt('#fCrop'), group_name: opt('#fGrp'), farmland_id: opt('#fFarm'), geometry: pending };
+  try { await api('/plots', { method: 'POST', body: JSON.stringify(body) }); $('#form').reset(); await load(false); say('Lahan tersimpan.'); }
+  catch (err) { say(err.message); }
+  pending = null;
+});
+
+$('#imp').addEventListener('change', async (e) => {
+  const file = e.target.files[0]; e.target.value = '';
+  if (!file) return;
+  if (!token) return say('Isi token JWT di kolom atas dulu.');
+  try {
+    let g = JSON.parse(await file.text());
+    if (g.type === 'Polygon') g = { type: 'Feature', properties: {}, geometry: g };
+    if (g.type === 'Feature') g = { type: 'FeatureCollection', features: [g] };
+    const region = prompt('Kode wilayah untuk lahan yang tidak punya properti region_code:', $('#fRegion').value.trim()) || '';
+    const r = await api('/plots/import' + (region ? '?region_code=' + encodeURIComponent(region) : ''), { method: 'POST', body: JSON.stringify(g) });
+    await load(true); say(r.imported + ' lahan diimpor.');
+  } catch (err) { say('Impor gagal: ' + err.message); }
+});
+
+$('#reload').onclick = () => load(true);
+['#fRegion', '#fCom'].forEach((s) => $(s).addEventListener('change', () => load(true)));
+if (token) load(true);
+</script>
+</body>
+</html>

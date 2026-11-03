@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Jurnal Panen - AgroTrack</title>
+  <script src="/nav.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; padding-bottom: 80px; background: #f6f5f1; color: #1f2a24; }
+    header { padding: 16px 20px; background: #fff; border-bottom: 1px solid #ddd; }
+    h1 { font-size: 20px; margin: 0; }
+    h2 { font-size: 16px; margin: 0 0 8px; }
+    main { padding: 20px; max-width: 1000px; margin: auto; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 20px; }
+    .card { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; }
+    form.card label { display: block; font-size: 13px; color: #555; margin-bottom: 8px; }
+    input, select, button { padding: 8px 10px; border: 1px solid #bbb; border-radius: 6px; font: inherit; width: 100%; box-sizing: border-box; }
+    button { background: #1e5a3c; color: #fff; border-color: #1e5a3c; cursor: pointer; width: auto; }
+    button.ghost { background: transparent; color: #b00020; border-color: #b00020; }
+    .row { display: flex; gap: 8px; margin-bottom: 8px; }
+    .badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #e4efe8; color: #1e5a3c; }
+    .badge.siap_panen { background: #fbeccd; color: #8a5a00; }
+    .badge.selesai { background: #e3e8f2; color: #2c4a7a; }
+    ul { margin: 6px 0; padding-left: 20px; font-size: 14px; }
+    table { width: 100%; border-collapse: collapse; background: #fff; font-size: 14px; }
+    td, th { border: 1px solid #ddd; padding: 6px 8px; text-align: left; vertical-align: top; }
+    #msg { min-height: 1.2em; } #msg.err { color: #b00020; } #msg.ok { color: #1e5a3c; }
+    footer { margin-top: 24px; font-size: 12px; color: #666; }
+  </style>
+</head>
+<body>
+  <header><h1>Jurnal panen petani</h1></header>
+  <main>
+    <p id="msg" role="status"></p>
+    <section class="grid">
+      <form id="f-cycle" class="card">
+        <h2>Siklus tanam baru</h2>
+        <label>Lahan <select id="plot" required></select></label>
+        <label>Komoditas (kosongkan jika sama dengan lahan) <input id="commodity" maxlength="50"></label>
+        <label>Tanggal tanam <input id="planting" type="date" required></label>
+        <label>Target panen <input id="expected" type="date"></label>
+        <label>Estimasi hasil (ton/ha) <input id="yield" type="number" step="any" min="0.1"></label>
+        <button>Simpan siklus</button>
+      </form>
+      <form id="f-input" class="card">
+        <h2>Catat pupuk / pestisida</h2>
+        <label>Siklus <select id="in-cycle" required></select></label>
+        <label>Jenis <select id="in-type"><option value="pupuk">Pupuk</option><option value="pestisida">Pestisida</option></select></label>
+        <label>Nama produk <input id="in-name" required maxlength="100"></label>
+        <label>Jumlah <input id="in-amount" type="number" step="any" min="0.01" required></label>
+        <label>Satuan <select id="in-unit"><option>kg</option><option>liter</option></select></label>
+        <label>Tanggal <input id="in-date" type="date" required></label>
+        <button>Simpan catatan</button>
+      </form>
+      <form id="f-harvest" class="card">
+        <h2>Catat hasil panen</h2>
+        <label>Siklus <select id="hv-cycle" required></select></label>
+        <label>Tanggal panen <input id="hv-date" type="date" required></label>
+        <label>Hasil (ton) <input id="hv-ton" type="number" step="any" min="0" required></label>
+        <button>Simpan hasil</button>
+      </form>
+    </section>
+
+    <h2>Siklus tanam</h2>
+    <div id="cycles"></div>
+
+    <h2>Kalender cuaca dan agenda</h2>
+    <div class="row">
+      <input id="adm4" placeholder="Kode desa BMKG (adm4), contoh format NN.NN.NN.NNNN" aria-label="Kode wilayah adm4">
+      <button id="load-weather" type="button">Muat cuaca</button>
+    </div>
+    <p id="weather-info"></p>
+    <div id="agenda"></div>
+    <footer>Data prakiraan cuaca: BMKG (data.bmkg.go.id).</footer>
+  </main>
+
+  <script>
+    const m = location.hash.match(/token=([^&]+)/);
+    if (m) { try { sessionStorage.setItem('token', m[1]); } catch {} }
+    let token = null;
+    try { token = sessionStorage.getItem('token'); } catch {}
+
+    const $ = (id) => document.getElementById(id);
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const STATUS = { tumbuh: 'Tumbuh', siap_panen: 'Siap panen', selesai: 'Selesai' };
+    const show = (t, ok = false) => { $('msg').textContent = t; $('msg').className = ok ? 'ok' : 'err'; };
+    const todayStr = () => new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+    const addDays = (s, n) => { const d = new Date(s + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
+
+    let plots = [], cycles = [], weatherDays = [];
+
+    async function api(path, opts = {}) {
+      const res = await fetch('/api/v1' + path, {
+        method: opts.method ?? 'GET',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+        body: opts.body ? JSON.stringify(opts.body) : undefined,
+      });
+      if (res.status === 204) return null;
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error?.message ?? 'Permintaan gagal.');
+      return body;
+    }
+
+    const opt = (v, label) => `<option value="${esc(v)}">${esc(label)}</option>`;
+
+    function card(c) {
+      const inputs = c.inputs.map((i) =>
+        `<li>${esc(i.date)} · ${esc(i.type)} ${esc(i.name)} · ${esc(i.amount)} ${esc(i.unit)}</li>`).join('');
+      const result = c.actual_harvest_date
+        ? `Panen ${esc(c.actual_harvest_date)}: ${esc(c.actual_tonnage)} ton (${esc(c.actual_yield_ton_per_ha ?? '-')} ton/ha)`
+        : `Perkiraan panen: ${esc(c.est_tonnage ?? '-')} ton`;
+      return `<article class="card">
+        <b>${esc(c.plot_name)}</b> · ${esc(c.commodity)}
+        <span class="badge ${esc(c.status)}">${esc(STATUS[c.status])}</span>
+        <div>Tanam ${esc(c.planting_date)} · Target panen ${esc(c.expected_harvest_date ?? '-')} · ${esc(c.area_ha)} ha</div>
+        <div>${result}</div>
+        <ul>${inputs || '<li>Belum ada catatan pupuk/pestisida.</li>'}</ul>
+        <button class="ghost" data-del="${esc(c.id)}">Hapus</button>
+      </article>`;
+    }
+
+    function renderAgenda() {
+      const t = todayStr(), lo = addDays(t, -7), hi = addDays(t, 30);
+      const map = new Map();
+      const slot = (d) => map.get(d) ?? map.set(d, { w: null, ev: [] }).get(d);
+      for (const w of weatherDays) slot(w.date).w = w;
+      for (const c of cycles) {
+        const label = `${c.plot_name} (${c.commodity})`;
+        for (const [d, what] of [[c.planting_date, 'Tanam'], [c.expected_harvest_date, 'Target panen'], [c.actual_harvest_date, 'Panen']]) {
+          if (d && d >= lo && d <= hi) slot(d).ev.push(`${what}: ${label}`);
+        }
+        for (const i of c.inputs) {
+          if (i.date >= lo && i.date <= hi) slot(i.date).ev.push(`${i.type} ${i.name}: ${label}`);
+        }
+      }
+      const wText = (w) => `${w.desc ?? '-'}, ${w.t_min ?? '?'}–${w.t_max ?? '?'}°C, hujan ${w.rain_mm} mm`;
+      const rows = [...map].sort(([a], [b]) => a.localeCompare(b)).map(([d, v]) =>
+        `<tr><td>${esc(d)}${d === t ? ' (hari ini)' : ''}</td><td>${v.w ? esc(wText(v.w)) : '-'}</td><td>${v.ev.map(esc).join('<br>') || '-'}</td></tr>`);
+      $('agenda').innerHTML = rows.length
+        ? `<table><tr><th>Tanggal</th><th>Cuaca (BMKG)</th><th>Agenda lahan</th></tr>${rows.join('')}</table>`
+        : '<p>Belum ada agenda. Muat cuaca atau catat siklus tanam.</p>';
+    }
+
+    function render() {
+      $('plot').innerHTML = plots.map((p) => opt(p.id, `${p.name} (${p.area_ha} ha)`)).join('') || '<option value="">Belum ada lahan</option>';
+      const co = cycles.map((c) => opt(c.id, `${c.plot_name} · ${c.commodity} · ${c.planting_date}`)).join('') || '<option value="">Belum ada siklus</option>';
+      $('in-cycle').innerHTML = co;
+      $('hv-cycle').innerHTML = co;
+      $('cycles').innerHTML = cycles.map(card).join('') || '<p>Belum ada siklus tanam.</p>';
+      renderAgenda();
+    }
+
+    async function loadAll() {
+      if (!token) { show('Token tidak ada. Buka halaman lewat menu navigasi atau URL dari npm run token.'); return; }
+      try {
+        const [fc, h] = await Promise.all([api('/plots'), api('/harvest')]);
+        plots = fc.features.map((f) => f.properties);
+        cycles = h.items;
+        render();
+      } catch (e) { show(e.message); }
+    }
+
+    function onSubmit(id, fn, okText) {
+      $(id).onsubmit = async (e) => {
+        e.preventDefault();
+        try { await fn(); show(okText, true); e.target.reset(); await loadAll(); }
+        catch (err) { show(err.message); }
+      };
+    }
+
+    onSubmit('f-cycle', () => api('/harvest', { method: 'POST', body: {
+      plot_id: $('plot').value,
+      commodity: $('commodity').value.trim() || undefined,
+      planting_date: $('planting').value,
+      expected_harvest_date: $('expected').value || undefined,
+      est_yield_ton_per_ha: $('yield').value ? Number($('yield').value) : undefined,
+      client_id: crypto.randomUUID(),
+    } }), 'Siklus tersimpan.');
+
+    onSubmit('f-input', () => api(`/harvest/${encodeURIComponent($('in-cycle').value)}/inputs`, { method: 'POST', body: {
+      type: $('in-type').value,
+      name: $('in-name').value.trim(),
+      amount: Number($('in-amount').value),
+      unit: $('in-unit').value,
+      date: $('in-date').value,
+    } }), 'Catatan tersimpan.');
+
+    onSubmit('f-harvest', () => api(`/harvest/${encodeURIComponent($('hv-cycle').value)}/harvest`, { method: 'POST', body: {
+      actual_harvest_date: $('hv-date').value,
+      actual_tonnage: Number($('hv-ton').value),
+    } }), 'Hasil panen tersimpan.');
+
+    $('cycles').onclick = async (e) => {
+      const id = e.target.dataset.del;
+      if (!id || !confirm('Hapus siklus ini?')) return;
+      try { await api('/harvest/' + encodeURIComponent(id), { method: 'DELETE' }); show('Siklus dihapus.', true); await loadAll(); }
+      catch (err) { show(err.message); }
+    };
+
+    try { $('adm4').value = localStorage.getItem('adm4') ?? ''; } catch {}
+    $('load-weather').onclick = async () => {
+      const code = $('adm4').value.trim();
+      try { localStorage.setItem('adm4', code); } catch {}
+      try {
+        const w = await api('/weather' + (code ? '?adm4=' + encodeURIComponent(code) : ''));
+        weatherDays = w.days;
+        $('weather-info').textContent = 'Lokasi prakiraan: ' + (w.location || code) + ' · Sumber: BMKG';
+        show('', true);
+        renderAgenda();
+      } catch (err) { show(err.message); }
+    };
+
+    loadAll();
+  </script>
+</body>
+</html>

@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Rantai Pasok - AgroTrack</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; background: #f6f5f1; color: #1f2a24; }
+    header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 16px 20px; background: #fff; border-bottom: 1px solid #ddd; }
+    h1 { font-size: 20px; margin: 0 auto 0 0; }
+    input, select, button { padding: 8px 10px; border: 1px solid #bbb; border-radius: 6px; font: inherit; }
+    button { background: #1e5a3c; color: #fff; border-color: #1e5a3c; cursor: pointer; }
+    main { padding: 20px 20px 90px; max-width: 1100px; margin: auto; }
+    #msg { color: #b00020; min-height: 1.2em; }
+    .grid { display: grid; grid-template-columns: 1.3fr 1fr; gap: 16px; }
+    @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+    .box { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px 14px; overflow-x: auto; }
+    table { border-collapse: collapse; width: 100%; font-size: 14px; }
+    th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #eee; }
+    tbody tr[data-code] { cursor: pointer; }
+    tbody tr[data-code]:hover { background: #f1f6f3; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #e6efe9; color: #1e5a3c; font-size: 12px; }
+    .tl { padding-left: 18px; margin: 12px 0; }
+    .tl li { margin-bottom: 10px; }
+    .tl small { color: #666; display: block; }
+    h2 { font-size: 17px; margin: 0 0 6px; }
+    #vres { margin-left: 8px; font-weight: 600; }
+  </style>
+  <script src="/nav.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Rantai pasok komoditas</h1>
+    <select id="status" aria-label="Status">
+      <option value="">Semua status</option>
+      <option value="CREATED">Dibuat</option>
+      <option value="IN_TRANSIT">Dalam perjalanan</option>
+      <option value="SORTED">Disortir</option>
+      <option value="RECEIVED">Diterima</option>
+    </select>
+    <input id="commodity" placeholder="Komoditas" aria-label="Komoditas">
+    <button id="load">Muat batch</button>
+  </header>
+  <main>
+    <p id="msg"></p>
+    <div class="grid">
+      <section class="box">
+        <p id="count"></p>
+        <table>
+          <thead><tr><th>Kode</th><th>Komoditas</th><th>Berat</th><th>Status</th><th>Lokasi</th></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </section>
+      <aside class="box" id="detail">Pilih satu batch di daftar untuk melihat riwayatnya.</aside>
+    </div>
+  </main>
+  <script>
+    const m = location.hash.match(/token=([^&]+)/);
+    if (m) { try { sessionStorage.setItem('token', m[1]); } catch {} }
+    let token = null;
+    try { token = sessionStorage.getItem('token'); } catch {}
+
+    const $ = (id) => document.getElementById(id);
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const STATUS = { CREATED: 'Dibuat', IN_TRANSIT: 'Dalam perjalanan', SORTED: 'Disortir', RECEIVED: 'Diterima' };
+    const EVENT = { BATCH_CREATED: 'Batch dibuat', TRANSFERRED: 'Dipindahkan', SORTED: 'Disortir', RECEIVED: 'Diterima' };
+    const LOC = { FARM: 'Lahan', WAREHOUSE: 'Gudang', STORE: 'Supermarket' };
+    const fmtLoc = (l) => (l ? (LOC[l.type] ?? l.type) + ': ' + l.name : '-');
+    const fmtDate = (d) => new Date(d).toLocaleString('id-ID');
+    const kg = (n) => (n == null ? '-' : n.toLocaleString('id-ID') + ' kg');
+
+    async function req(path, blob) {
+      const res = await fetch('/api/v1/batches' + path, { headers: { Authorization: 'Bearer ' + token } });
+      if (blob && res.ok) return res.blob();
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error?.message ?? 'Gagal memuat data.');
+      return body;
+    }
+
+    async function load() {
+      $('msg').textContent = '';
+      if (!token) { $('msg').textContent = 'Token tidak ada. Buka halaman lewat URL dari npm run token.'; return; }
+      const q = new URLSearchParams();
+      if ($('status').value) q.set('status', $('status').value);
+      if ($('commodity').value.trim()) q.set('commodity', $('commodity').value.trim());
+      try {
+        const r = await req('?' + q);
+        $('count').textContent = r.total + ' batch';
+        $('rows').innerHTML = r.items.length
+          ? r.items.map((b) => '<tr data-code="' + esc(b.code) + '"><td>' + esc(b.code) + '</td><td>' + esc(b.commodity) + '</td><td>' + kg(b.weight_kg) + '</td><td><span class="badge">' + esc(STATUS[b.status] ?? b.status) + '</span></td><td>' + esc(fmtLoc(b.current_location)) + '</td></tr>').join('')
+          : '<tr><td colspan="5">Belum ada batch.</td></tr>';
+      } catch (e) { $('msg').textContent = e.message; }
+    }
+
+    async function showDetail(code) {
+      $('detail').textContent = 'Memuat...';
+      try {
+        const base = '/' + encodeURIComponent(code);
+        const [b, ev] = await Promise.all([req(base), req(base + '/events')]);
+        $('detail').innerHTML =
+          '<h2>' + esc(b.code) + '</h2>' +
+          '<p>' + esc(b.commodity) + ' · ' + kg(b.weight_kg) + ' · <b>' + esc(STATUS[b.status] ?? b.status) + '</b></p>' +
+          '<p>Lokasi sekarang: ' + esc(fmtLoc(b.current_location)) + '</p>' +
+          '<img id="qr" alt="QR ' + esc(b.code) + '" width="140" height="140">' +
+          '<ol class="tl">' + ev.events.map((e) =>
+            '<li><b>' + esc(EVENT[e.type] ?? e.type) + '</b> ' + esc(e.from ? fmtLoc(e.from) + ' → ' : '') + esc(fmtLoc(e.to)) +
+            '<small>' + esc(fmtDate(e.occurred_at)) + ' · ' + esc(e.actor_id) +
+            (e.weight_kg != null ? ' · ' + kg(e.weight_kg) : '') + (e.grade ? ' · grade ' + esc(e.grade) : '') +
+            (e.note ? ' · ' + esc(e.note) : '') + '</small></li>').join('') + '</ol>' +
+          '<button id="verify">Periksa keaslian rantai</button><span id="vres"></span>';
+        $('verify').onclick = async () => {
+          $('vres').textContent = '...';
+          try {
+            const v = await req(base + '/verify');
+            $('vres').textContent = v.valid ? 'Rantai utuh' : 'Rantai rusak di urutan ' + v.broken_at_seq;
+            $('vres').style.color = v.valid ? '#1e5a3c' : '#b00020';
+          } catch (e) { $('vres').textContent = e.message; }
+        };
+        req(base + '/qr?format=svg', true)
+          .then((bl) => { $('qr').src = URL.createObjectURL(bl); })
+          .catch(() => { $('qr')?.remove(); });
+      } catch (e) { $('detail').textContent = e.message; }
+    }
+
+    $('rows').addEventListener('click', (e) => {
+      const tr = e.target.closest('tr[data-code]');
+      if (tr) showDetail(tr.dataset.code);
+    });
+    $('load').onclick = load;
+    load();
+  </script>
+</body>
+</html>
