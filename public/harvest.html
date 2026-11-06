@@ -13,6 +13,7 @@
     main { padding: 20px; max-width: 1000px; margin: auto; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 20px; }
     .card { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; }
+    .card.err { border-color: #b00020; }
     form.card label { display: block; font-size: 13px; color: #555; margin-bottom: 8px; }
     input, select, button { padding: 8px 10px; border: 1px solid #bbb; border-radius: 6px; font: inherit; width: 100%; box-sizing: border-box; }
     button { background: #1e5a3c; color: #fff; border-color: #1e5a3c; cursor: pointer; width: auto; }
@@ -21,9 +22,13 @@
     .badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #e4efe8; color: #1e5a3c; }
     .badge.siap_panen { background: #fbeccd; color: #8a5a00; }
     .badge.selesai { background: #e3e8f2; color: #2c4a7a; }
+    .badge.pending { background: #fde2e2; color: #8a1c1c; }
     ul { margin: 6px 0; padding-left: 20px; font-size: 14px; }
+    li.pend { color: #8a5a00; }
     table { width: 100%; border-collapse: collapse; background: #fff; font-size: 14px; }
     td, th { border: 1px solid #ddd; padding: 6px 8px; text-align: left; vertical-align: top; }
+    #net-bar { display: flex; gap: 12px; align-items: center; justify-content: space-between; font-size: 14px; }
+    #net-bar.off { background: #fff4e0; border-color: #e0b060; }
     #msg { min-height: 1.2em; } #msg.err { color: #b00020; } #msg.ok { color: #1e5a3c; }
     footer { margin-top: 24px; font-size: 12px; color: #666; }
   </style>
@@ -31,6 +36,11 @@
 <body>
   <header><h1>Jurnal panen petani</h1></header>
   <main>
+    <div id="net-bar" class="card" role="status">
+      <span id="net-text">Memeriksa koneksi...</span>
+      <button id="sync-now" type="button" hidden>Sinkronkan sekarang</button>
+    </div>
+    <div id="failed"></div>
     <p id="msg" role="status"></p>
     <section class="grid">
       <form id="f-cycle" class="card">
@@ -76,47 +86,165 @@
 
   <script>
     const m = location.hash.match(/token=([^&]+)/);
-    if (m) { try { sessionStorage.setItem('token', m[1]); } catch {} }
+    if (m) { try { sessionStorage.setItem('token', m[1]); localStorage.setItem('token_backup', m[1]); } catch {} }
     let token = null;
-    try { token = sessionStorage.getItem('token'); } catch {}
+    try { token = sessionStorage.getItem('token') ?? localStorage.getItem('token_backup'); } catch {}
 
     const $ = (id) => document.getElementById(id);
     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
       ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     const STATUS = { tumbuh: 'Tumbuh', siap_panen: 'Siap panen', selesai: 'Selesai' };
+    const OPLABEL = { cycle: 'siklus tanam', input: 'catatan pupuk/pestisida', harvest: 'hasil panen' };
+    const AUTH_MSG = 'Token kedaluwarsa atau ditolak. Buka ulang halaman lewat URL dari npm run token. Catatanmu tetap aman di perangkat ini.';
     const show = (t, ok = false) => { $('msg').textContent = t; $('msg').className = ok ? 'ok' : 'err'; };
     const todayStr = () => new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10);
     const addDays = (s, n) => { const d = new Date(s + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
+    const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : 'c-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10));
 
-    let plots = [], cycles = [], weatherDays = [];
+    let plots = [], cycles = [], viewCycles = [], weatherDays = [];
+    let idmap = {};                 // client_id siklus offline -> id asli di server
+    let online = navigator.onLine;  // terakhir diketahui
+
+    // ---------- penyimpanan offline (IndexedDB): antrean tulis + cache baca ----------
+    let dbp = null;
+    function db() {
+      dbp ??= new Promise((resolve, reject) => {
+        const r = indexedDB.open('agrotrack-harvest', 1);
+        r.onupgradeneeded = () => {
+          r.result.createObjectStore('queue', { keyPath: 'seq', autoIncrement: true });
+          r.result.createObjectStore('cache');
+        };
+        r.onsuccess = () => resolve(r.result);
+        r.onerror = () => reject(r.error);
+      });
+      return dbp;
+    }
+    async function tx(store, mode, fn) {
+      const d = await db();
+      return new Promise((resolve, reject) => {
+        const t = d.transaction(store, mode);
+        const req = fn(t.objectStore(store));
+        t.oncomplete = () => resolve(req.result);
+        t.onerror = () => reject(t.error);
+        t.onabort = () => reject(t.error);
+      });
+    }
+    const kvGet = (k) => tx('cache', 'readonly', (s) => s.get(k));
+    const kvSet = (k, v) => tx('cache', 'readwrite', (s) => s.put(v, k));
+    const qAll = () => tx('queue', 'readonly', (s) => s.getAll());
+    const qAdd = (op) => tx('queue', 'readwrite', (s) => s.add(op));
+    const qPut = (op) => tx('queue', 'readwrite', (s) => s.put(op));
+    const qDel = (seq) => tx('queue', 'readwrite', (s) => s.delete(seq));
+
+    // ---------- panggilan API ----------
+    class ApiError extends Error { constructor(msg, status) { super(msg); this.status = status; } }
 
     async function api(path, opts = {}) {
-      const res = await fetch('/api/v1' + path, {
-        method: opts.method ?? 'GET',
-        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
-        body: opts.body ? JSON.stringify(opts.body) : undefined,
-      });
+      let res;
+      try {
+        res = await fetch('/api/v1' + path, {
+          method: opts.method ?? 'GET',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+          body: opts.body ? JSON.stringify(opts.body) : undefined,
+        });
+      } catch { throw new ApiError('Tidak ada koneksi ke server.', 0); }
       if (res.status === 204) return null;
       const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body.error?.message ?? 'Permintaan gagal.');
+      if (!res.ok) throw new ApiError(body.error?.message ?? 'Permintaan gagal.', res.status);
       return body;
+    }
+
+    // ---------- sinkronisasi antrean (urut, satu per satu) ----------
+    let flushing = false;
+    async function flush() {
+      if (flushing || !token) return flushing ? 'busy' : null;
+      flushing = true;
+      let stopped = null;
+      try {
+        for (const op of await qAll()) {
+          if (op.error) continue;
+          let ref = op.cycleRef;
+          if (ref?.startsWith('client:')) {
+            ref = idmap[ref.slice(7)];
+            if (!ref) { op.error = 'Siklus induknya belum tersimpan di server.'; await qPut(op); continue; }
+          }
+          try {
+            if (op.type === 'cycle') {
+              const c = await api('/harvest', { method: 'POST', body: op.body });
+              idmap[op.body.client_id] = c.id;
+              await kvSet('idmap', idmap);
+            } else if (op.type === 'input') {
+              await api(`/harvest/${encodeURIComponent(ref)}/inputs`, { method: 'POST', body: op.body });
+            } else {
+              await api(`/harvest/${encodeURIComponent(ref)}/harvest`, { method: 'POST', body: op.body });
+            }
+            await qDel(op.seq);
+            online = true;
+          } catch (e) {
+            if (e.status === 0) { online = false; stopped = 'offline'; break; }
+            if (e.status === 401 || e.status === 403) { stopped = 'auth'; break; }
+            if (e.status >= 500 || e.status === 429) { stopped = 'server'; break; }
+            op.error = e.message; await qPut(op);   // ditolak server (data tidak valid): tandai, lanjut
+          }
+        }
+      } finally { flushing = false; }
+      return stopped;
+    }
+
+    // ---------- tampilan: data server + catatan yang masih mengantre ----------
+    function resolveRef(ref) {
+      return ref?.startsWith('client:') ? (idmap[ref.slice(7)] ?? ref) : ref;
+    }
+
+    function buildView(ops) {
+      const view = cycles.map((c) => ({ ...c, inputs: [...c.inputs] }));
+      const byId = new Map(view.map((c) => [c.id, c]));
+      for (const op of ops) {
+        if (op.type === 'cycle') {
+          const p = plots.find((x) => x.id === op.body.plot_id);
+          const area = p?.area_ha;
+          const est = op.body.est_yield_ton_per_ha && area ? Math.round(op.body.est_yield_ton_per_ha * area * 100) / 100 : null;
+          const c = {
+            id: 'client:' + op.body.client_id, pending: true, plot_name: p?.name ?? '(lahan)',
+            commodity: op.body.commodity ?? p?.commodity ?? '-', status: 'tumbuh',
+            planting_date: op.body.planting_date, expected_harvest_date: op.body.expected_harvest_date ?? null,
+            area_ha: area ?? '-', est_tonnage: est, inputs: [],
+          };
+          view.push(c); byId.set(c.id, c);
+          continue;
+        }
+        const c = byId.get(resolveRef(op.cycleRef));
+        if (!c) continue;
+        c.changed = true;
+        if (op.type === 'input') c.inputs.push({ ...op.body, pending: true });
+        if (op.type === 'harvest') {
+          c.actual_harvest_date = op.body.actual_harvest_date;
+          c.actual_tonnage = op.body.actual_tonnage;
+          c.actual_yield_ton_per_ha = typeof c.area_ha === 'number' && c.area_ha > 0
+            ? Math.round((op.body.actual_tonnage / c.area_ha) * 100) / 100 : null;
+          c.status = 'selesai';
+        }
+      }
+      return view;
     }
 
     const opt = (v, label) => `<option value="${esc(v)}">${esc(label)}</option>`;
 
     function card(c) {
+      const flag = c.pending || c.changed;
       const inputs = c.inputs.map((i) =>
-        `<li>${esc(i.date)} · ${esc(i.type)} ${esc(i.name)} · ${esc(i.amount)} ${esc(i.unit)}</li>`).join('');
+        `<li${i.pending ? ' class="pend"' : ''}>${esc(i.date)} · ${esc(i.type)} ${esc(i.name)} · ${esc(i.amount)} ${esc(i.unit)}${i.pending ? ' (belum tersinkron)' : ''}</li>`).join('');
       const result = c.actual_harvest_date
         ? `Panen ${esc(c.actual_harvest_date)}: ${esc(c.actual_tonnage)} ton (${esc(c.actual_yield_ton_per_ha ?? '-')} ton/ha)`
         : `Perkiraan panen: ${esc(c.est_tonnage ?? '-')} ton`;
       return `<article class="card">
         <b>${esc(c.plot_name)}</b> · ${esc(c.commodity)}
         <span class="badge ${esc(c.status)}">${esc(STATUS[c.status])}</span>
+        ${flag ? '<span class="badge pending">Belum tersinkron</span>' : ''}
         <div>Tanam ${esc(c.planting_date)} · Target panen ${esc(c.expected_harvest_date ?? '-')} · ${esc(c.area_ha)} ha</div>
         <div>${result}</div>
         <ul>${inputs || '<li>Belum ada catatan pupuk/pestisida.</li>'}</ul>
-        <button class="ghost" data-del="${esc(c.id)}">Hapus</button>
+        ${flag ? '' : `<button class="ghost" data-del="${esc(c.id)}">Hapus</button>`}
       </article>`;
     }
 
@@ -125,7 +253,7 @@
       const map = new Map();
       const slot = (d) => map.get(d) ?? map.set(d, { w: null, ev: [] }).get(d);
       for (const w of weatherDays) slot(w.date).w = w;
-      for (const c of cycles) {
+      for (const c of viewCycles) {
         const label = `${c.plot_name} (${c.commodity})`;
         for (const [d, what] of [[c.planting_date, 'Tanam'], [c.expected_harvest_date, 'Target panen'], [c.actual_harvest_date, 'Panen']]) {
           if (d && d >= lo && d <= hi) slot(d).ev.push(`${what}: ${label}`);
@@ -142,43 +270,96 @@
         : '<p>Belum ada agenda. Muat cuaca atau catat siklus tanam.</p>';
     }
 
-    function render() {
+    function renderBar(ops) {
+      const waiting = ops.filter((o) => !o.error).length;
+      const failed = ops.filter((o) => o.error);
+      $('net-bar').className = 'card' + (online ? '' : ' off');
+      $('net-text').textContent = (online ? 'Terhubung ke server' : 'Offline, data disimpan di perangkat')
+        + (waiting ? ` · ${waiting} catatan menunggu sinkronisasi` : ' · semua catatan sudah tersinkron');
+      $('sync-now').hidden = !waiting;
+      $('failed').innerHTML = failed.map((op) =>
+        `<div class="card err">Gagal disinkronkan (${esc(OPLABEL[op.type])}): ${esc(op.error)} <button class="ghost" data-discard="${esc(op.seq)}">Buang</button></div>`).join('');
+    }
+
+    async function render() {
+      const ops = await qAll();
+      viewCycles = buildView(ops.filter((o) => !o.error));
       $('plot').innerHTML = plots.map((p) => opt(p.id, `${p.name} (${p.area_ha} ha)`)).join('') || '<option value="">Belum ada lahan</option>';
-      const co = cycles.map((c) => opt(c.id, `${c.plot_name} · ${c.commodity} · ${c.planting_date}`)).join('') || '<option value="">Belum ada siklus</option>';
+      const co = viewCycles.map((c) => opt(c.id, `${c.plot_name} · ${c.commodity} · ${c.planting_date}`)).join('') || '<option value="">Belum ada siklus</option>';
+      const keepIn = $('in-cycle').value, keepHv = $('hv-cycle').value;
       $('in-cycle').innerHTML = co;
       $('hv-cycle').innerHTML = co;
-      $('cycles').innerHTML = cycles.map(card).join('') || '<p>Belum ada siklus tanam.</p>';
+      if (viewCycles.some((c) => c.id === keepIn)) $('in-cycle').value = keepIn;
+      if (viewCycles.some((c) => c.id === keepHv)) $('hv-cycle').value = keepHv;
+      $('cycles').innerHTML = viewCycles.map(card).join('') || '<p>Belum ada siklus tanam.</p>';
       renderAgenda();
+      renderBar(ops);
+    }
+
+    function showCachedWeather(c) {
+      weatherDays = c.days;
+      $('weather-info').textContent = 'Lokasi prakiraan: ' + (c.location || '-') + ' · Sumber: BMKG · tersimpan ' + String(c.at ?? '').slice(0, 16).replace('T', ' ');
     }
 
     async function loadAll() {
-      if (!token) { show('Token tidak ada. Buka halaman lewat menu navigasi atau URL dari npm run token.'); return; }
+      if (!token) { show('Token tidak ada. Buka halaman lewat menu navigasi atau URL dari npm run token.'); await render().catch(() => {}); return; }
       try {
         const [fc, h] = await Promise.all([api('/plots'), api('/harvest')]);
         plots = fc.features.map((f) => f.properties);
         cycles = h.items;
-        render();
-      } catch (e) { show(e.message); }
+        online = true;
+        await kvSet('plots', plots);
+        await kvSet('cycles', cycles);
+      } catch (e) {
+        if (e.status === 0) online = false;
+        const [p, c, w] = await Promise.all([kvGet('plots'), kvGet('cycles'), kvGet('weather')]);
+        if (p && c) { plots = p; cycles = c; }
+        if (w && !weatherDays.length) showCachedWeather(w);
+        if (e.status === 0) show(p && c ? 'Offline: menampilkan data tersimpan terakhir.' : 'Offline dan belum ada data tersimpan di perangkat ini.', !!(p && c));
+        else if (e.status === 401 || e.status === 403) show(AUTH_MSG);
+        else show(e.message);
+      }
+      await render();
     }
 
-    function onSubmit(id, fn, okText) {
+    async function sync() {
+      const before = (await qAll()).filter((o) => !o.error).length;
+      const stopped = await flush();
+      await loadAll();
+      if (stopped === 'auth') show(AUTH_MSG);
+      else if (!stopped && before) show(`${before} catatan berhasil disinkronkan.`, true);
+      return stopped;
+    }
+
+    async function submitOp(op, okText) {
+      await qAdd(op);                       // selalu masuk antrean dulu, lalu coba kirim
+      const stopped = await flush();
+      await loadAll();
+      if (stopped === 'offline') show('Tidak ada sinyal. Catatan disimpan di perangkat dan dikirim otomatis saat koneksi kembali.', true);
+      else if (stopped === 'auth') show(AUTH_MSG);
+      else if (stopped === 'server') show('Server belum merespons. Catatan disimpan dan akan dicoba lagi.', true);
+      else show(okText, true);
+    }
+
+    function onSubmit(id, build, okText) {
       $(id).onsubmit = async (e) => {
         e.preventDefault();
-        try { await fn(); show(okText, true); e.target.reset(); await loadAll(); }
-        catch (err) { show(err.message); }
+        const form = e.target;
+        try { await submitOp(build(), okText); form.reset(); }
+        catch (err) { show('Gagal menyimpan di perangkat: ' + err.message); }
       };
     }
 
-    onSubmit('f-cycle', () => api('/harvest', { method: 'POST', body: {
+    onSubmit('f-cycle', () => ({ type: 'cycle', body: {
       plot_id: $('plot').value,
       commodity: $('commodity').value.trim() || undefined,
       planting_date: $('planting').value,
       expected_harvest_date: $('expected').value || undefined,
       est_yield_ton_per_ha: $('yield').value ? Number($('yield').value) : undefined,
-      client_id: crypto.randomUUID(),
+      client_id: uuid(),
     } }), 'Siklus tersimpan.');
 
-    onSubmit('f-input', () => api(`/harvest/${encodeURIComponent($('in-cycle').value)}/inputs`, { method: 'POST', body: {
+    onSubmit('f-input', () => ({ type: 'input', cycleRef: $('in-cycle').value, body: {
       type: $('in-type').value,
       name: $('in-name').value.trim(),
       amount: Number($('in-amount').value),
@@ -186,7 +367,7 @@
       date: $('in-date').value,
     } }), 'Catatan tersimpan.');
 
-    onSubmit('f-harvest', () => api(`/harvest/${encodeURIComponent($('hv-cycle').value)}/harvest`, { method: 'POST', body: {
+    onSubmit('f-harvest', () => ({ type: 'harvest', cycleRef: $('hv-cycle').value, body: {
       actual_harvest_date: $('hv-date').value,
       actual_tonnage: Number($('hv-ton').value),
     } }), 'Hasil panen tersimpan.');
@@ -195,8 +376,23 @@
       const id = e.target.dataset.del;
       if (!id || !confirm('Hapus siklus ini?')) return;
       try { await api('/harvest/' + encodeURIComponent(id), { method: 'DELETE' }); show('Siklus dihapus.', true); await loadAll(); }
-      catch (err) { show(err.message); }
+      catch (err) { show(err.status === 0 ? 'Menghapus siklus butuh koneksi ke server.' : err.message); }
     };
+
+    $('failed').onclick = async (e) => {
+      const seq = e.target.dataset.discard;
+      if (!seq) return;
+      await qDel(Number(seq));
+      await render();
+    };
+
+    $('sync-now').onclick = () => sync();
+    window.addEventListener('online', () => sync());
+    window.addEventListener('offline', async () => { online = false; await render(); });
+    setInterval(async () => {
+      if (document.hidden) return;
+      if ((await qAll()).some((o) => !o.error)) sync();
+    }, 30000);
 
     try { $('adm4').value = localStorage.getItem('adm4') ?? ''; } catch {}
     $('load-weather').onclick = async () => {
@@ -206,12 +402,22 @@
         const w = await api('/weather' + (code ? '?adm4=' + encodeURIComponent(code) : ''));
         weatherDays = w.days;
         $('weather-info').textContent = 'Lokasi prakiraan: ' + (w.location || code) + ' · Sumber: BMKG';
+        await kvSet('weather', { ...w, at: new Date().toISOString() });
         show('', true);
         renderAgenda();
-      } catch (err) { show(err.message); }
+      } catch (err) {
+        const cached = err.status === 0 ? await kvGet('weather') : null;
+        if (cached) { showCachedWeather(cached); renderAgenda(); show('Offline: menampilkan prakiraan cuaca yang tersimpan.', true); }
+        else show(err.message);
+      }
     };
 
-    loadAll();
+    (async () => {
+      try { idmap = (await kvGet('idmap')) ?? {}; } catch {}
+      await sync();
+    })();
+
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
   </script>
 </body>
 </html>
